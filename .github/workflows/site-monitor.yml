@@ -1,0 +1,85 @@
+# AuraPrints outside monitor (deploy/monitor/README.md). Lives in a small PUBLIC repository with no secrets: it only
+# fetches public URLs. Every 10 minutes it checks the site; a URL counts as down only after it fails twice in a row,
+# 4 minutes apart. Then the run fails and GitHub emails the repository's watchers / the workflow's last editor.
+# The server's daily check (scripts/ops_check.py) alerts in the other direction: when these requests stop arriving.
+name: Site monitor
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # best effort: GitHub may start scheduled runs late under load
+    - cron: "17 3 1 * *"     # monthly keepalive (scheduled workflows in public repos stop after 60 days without activity)
+  workflow_dispatch:
+    inputs:
+      alert_test:
+        description: "Alert test: also check a URL that always returns 404, so this run fails and GitHub emails"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: site-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.event.schedule != '17 3 1 * *'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Check the public URLs (two failures in a row = down)
+        shell: bash
+        env:
+          ALERT_TEST: ${{ inputs.alert_test }}   # empty on scheduled runs
+        run: |
+          set -uo pipefail
+          UA="AuraPrints-Monitor/1 (+github-actions; ${GITHUB_REPOSITORY})"
+          # url | text the body must contain
+          TARGETS=(
+            'https://auraprints.twincord.in/api/health|"status":"ok"'
+            'https://auraprints.twincord.in/|<title>'
+            'https://admin.auraprints.twincord.in/|<title>'
+            'https://auraprints.twincord.in/p/kongu-printzone|<title>'
+            'https://auraprints.twincord.in/api/public/t/kongu-printzone|"accepting_orders"'
+          )
+          if [ "${ALERT_TEST:-}" = true ]; then
+            echo "alert test: adding a URL that always fails"
+            TARGETS+=('https://auraprints.twincord.in/api/monitor-alert-test|never')
+          fi
+          probe() {  # prints "ok" or the reason; never fails the shell
+            local url=${1%%|*} want=${1#*|} body code
+            body=$(mktemp)
+            code=$(curl -sS -o "$body" -w '%{http_code}' -A "$UA" --max-time 20 --connect-timeout 10 "$url" 2>&1) || { echo "network: $code"; rm -f "$body"; return; }
+            if [ "$code" != 200 ]; then echo "HTTP $code"
+            elif ! grep -qF -- "$want" "$body"; then echo "HTTP 200 but missing: $want"
+            else echo ok; fi
+            rm -f "$body"
+          }
+          failed=()
+          for t in "${TARGETS[@]}"; do r=$(probe "$t"); echo "pass 1  ${t%%|*}  $r"; [ "$r" = ok ] || failed+=("$t"); done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "pass 1: ${#failed[@]} failing; checking again in 4 minutes"; sleep 240
+            down=()
+            for t in "${failed[@]}"; do r=$(probe "$t"); echo "pass 2  ${t%%|*}  $r"; [ "$r" = ok ] || down+=("${t%%|*}: $r"); done
+            if [ ${#down[@]} -gt 0 ]; then
+              { echo "## AuraPrints is DOWN"; printf -- '- %s\n' "${down[@]}"; } >> "$GITHUB_STEP_SUMMARY"
+              printf '::error::DOWN %s\n' "${down[@]}"
+              exit 1
+            fi
+          fi
+          echo "## All ${#TARGETS[@]} checks OK" >> "$GITHUB_STEP_SUMMARY"
+
+  keepalive:
+    if: github.event.schedule == '17 3 1 * *'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Empty commit so GitHub keeps the schedule on
+        run: |
+          git config user.name "site-monitor keepalive"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive $(date -u +%F)"
+          git push
