@@ -34,13 +34,14 @@ jobs:
         run: |
           set -uo pipefail
           UA="AuraPrints-Monitor/1 (+github-actions; ${GITHUB_REPOSITORY})"
-          # url | text the body must contain
+          # url | what the response must have: text the body contains, or "jq:<expression>" that is true for the JSON
+          # body. Every URL must answer within 10 seconds (a slow page counts as a failure).
           TARGETS=(
             'https://auraprints.twincord.in/api/health|"status":"ok"'
             'https://auraprints.twincord.in/|<title>'
             'https://admin.auraprints.twincord.in/|<title>'
             'https://auraprints.twincord.in/p/kongu-printzone|<title>'
-            'https://auraprints.twincord.in/api/public/t/kongu-printzone|"accepting_orders"'
+            'https://auraprints.twincord.in/api/public/t/kongu-printzone|jq:.accepting_orders == true'
           )
           if [ "${ALERT_TEST:-}" = true ]; then
             echo "alert test: adding a URL that always fails"
@@ -49,8 +50,12 @@ jobs:
           probe() {  # prints "ok" or the reason; never fails the shell
             local url=${1%%|*} want=${1#*|} body code
             body=$(mktemp)
-            code=$(curl -sS -o "$body" -w '%{http_code}' -A "$UA" --max-time 20 --connect-timeout 10 "$url" 2>&1) || { echo "network: $code"; rm -f "$body"; return; }
+            code=$(curl -sS -o "$body" -w '%{http_code}' -A "$UA" --max-time 10 --connect-timeout 5 "$url" 2>&1) || { echo "network: $code"; rm -f "$body"; return; }
             if [ "$code" != 200 ]; then echo "HTTP $code"
+            elif [ "${want#jq:}" != "$want" ]; then
+              if ! jq empty "$body" >/dev/null 2>&1; then echo "HTTP 200 but not JSON"
+              elif ! jq -e -- "${want#jq:}" "$body" >/dev/null 2>&1; then echo "HTTP 200 but not true: ${want#jq:}"
+              else echo ok; fi
             elif ! grep -qF -- "$want" "$body"; then echo "HTTP 200 but missing: $want"
             else echo ok; fi
             rm -f "$body"
